@@ -1,0 +1,556 @@
+#!/usr/bin/python
+"""Smarter sketch mirror function for FreeCAD"""
+# Copyright (C) 2020  Arvid Norlander
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+
+import re
+import contextlib
+from dataclasses import dataclass, field
+from enum import IntEnum
+from itertools import count
+from math import atan2, fmod, pi, sqrt
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
+from PySide2 import QtWidgets
+
+import FreeCAD
+import FreeCADGui as Gui
+import Part
+import Sketcher
+import __FreeCADBase__ as Base
+from Part import Edge, Vertex
+
+SketchElement = Union[Edge, Vertex, Part.Shape]
+
+
+# BEGIN MAGIC VALUES
+# These magic values are not exported to Python it seems, declare them once here to make it easier
+# to replace with a better solution in the future
+class PointPos(IntEnum):
+    """From Constraint.h"""
+
+    none = 0
+    start = 1
+    end = 2
+    mid = 3
+
+
+class GeoEnum(IntEnum):
+    """From SketchObject.h"""
+
+    RtPnt = -1
+    HAxis = -1
+    VAxis = -2
+    RefExt = -3
+
+
+# From Constraint.h
+GeoUndef = -2000
+
+
+# END OF MAGIC VALUES
+
+
+class UserReportError(Exception):
+    """Errors to be shown to user in popup"""
+
+    def __init__(self, message):
+        self.message = message
+
+
+class InternalError(Exception):
+    """Errors that are not expected"""
+
+    def __init__(self, message):
+        self.message = message
+
+
+def get_geo_id(sketch: "Sketcher.SketchObject", object_name: str) -> Optional[int]:
+    """Resolve geometry IDs. Messy, surely there is a better way?"""
+    if object_name.startswith("Edge"):
+        return int(object_name[4:]) - 1
+    elif object_name.startswith("ExternalEdge"):
+        return -int(object_name[12:]) - 2
+    elif object_name.startswith("Vertex"):
+        return sketch.getGeoVertexIndex(int(object_name[6:]) - 1)[0]
+    elif object_name in ('H_Axis', 'V_Axis', 'RootPoint'):
+        # Ignore certain well known names, we don't want to copy them anyway
+        return None
+    raise InternalError(f"Failed to get geo ID for {object_name}")
+
+
+def get_mirror_ids(
+    sketch: "Sketcher.SketchObject", object_name: str
+) -> Tuple[int, PointPos]:
+    """Get geo ID and optional ref ID for mirroring point"""
+    if object_name.startswith("Vertex"):
+        return sketch.getGeoVertexIndex(int(object_name[6:]) - 1)
+    elif object_name == "H_Axis":
+        return GeoEnum.HAxis, PointPos.none
+    elif object_name == "V_Axis":
+        return GeoEnum.VAxis, PointPos.none
+    elif object_name == "RootPoint":
+        return GeoEnum.RtPnt, PointPos.start
+    else:
+        return get_geo_id(sketch, object_name), PointPos.none
+
+
+def perpendicular(v1: Base.Vector, rcl_base: Base.Vector, rcl_dir: Base.Vector):
+    """Not exported to python by Vector3D, so reimplementing it..."""
+    t = ((v1 - rcl_base) * rcl_dir) / (rcl_dir * rcl_dir)
+    return rcl_base + t * rcl_dir
+
+
+def is_axis_aligned(v: Base.Vector):
+    """Checks if a vector is axis aligned (at most one non-zero element)"""
+    if v.x == 0 and v.y == 0:
+        return True
+    if v.y == 0 and v.z == 0:
+        return True
+    if v.z == 0 and v.x == 0:
+        return True
+    return False
+
+
+def get_point_vector(
+    sketch: "Sketcher.SketchSketchObject", geoid: int, pointpos: PointPos
+) -> Base.Vector:
+    """Why is it so mess to get the coordinates of a point?"""
+    if geoid == GeoEnum.RtPnt and pointpos == PointPos.start:
+        return Base.Vector(0, 0, 0)
+
+    georef = get_geometry(sketch, geoid)
+    if isinstance(georef, Part.Point):
+        return Base.Vector(georef.X, georef.Y, georef.Z)
+
+    if pointpos == PointPos.start and hasattr(georef, "StartPoint"):
+        return georef.StartPoint
+    if pointpos == PointPos.end and hasattr(georef, "EndPoint"):
+        return georef.EndPoint
+    if pointpos == PointPos.mid and hasattr(georef, "Center"):
+        return georef.Center
+    raise InternalError(f"No idea what to do with {georef.TypeId} for point {pointpos}")
+
+
+def get_geometry(sketch: "Sketcher.SketchSketchObject", geoid: int):
+    """Work around the painful Python API"""
+    # Python sketch objects only have getGeometry in LinkStage3, not in 0.19
+    if hasattr(sketch, "getGeometry"):
+        return sketch.getGeometry(geoid)
+    if geoid >= 0:
+        return sketch.Geometry[geoid]
+    if geoid == GeoEnum.HAxis:
+        # Seems impossible to get hold of this (doesn't exist!). Return fake object.
+        return Part.LineSegment(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(1, 0, 0))
+    if geoid == GeoEnum.VAxis:
+        # Seems impossible to get hold of this (doesn't exist!). Return fake object.
+        return Part.LineSegment(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 1, 0))
+    if geoid < 0:
+        raise UserReportError(
+            "External geometry currently not supported (I can't figure out the Python interface)"
+        )
+
+
+@dataclass
+class MirrorResults:
+    """Results from the mirroring geometry. Contains information needed to fix up constraints"""
+
+    geo_id_map: Dict[int, int] = field(default_factory=dict)
+    """Mapping from old to new geo ID"""
+
+    is_start_end_inverted: Dict[int, bool] = field(default_factory=dict)
+    """Indicates geometry for which start and end point have been flipped"""
+
+
+def do_mirror(
+    sketch: "Sketcher.SketchSketchObject",
+    point_projector: Callable[[FreeCAD.Vector], FreeCAD.Vector],
+    to_mirror: List[int],
+    is_line: bool,
+) -> MirrorResults:
+    """
+    Common mirror code. The main difference between line and point mirroring is that for mirroring around a line we
+    need to project to a perpendicular point on the line. This is not needed in the point case. Abstract that via
+    a callable lambda parameter.
+    """
+    cgeoid = len(sketch.Geometry)
+    results = MirrorResults()
+    to_expose: Set[int] = set()
+
+    new_geovals: List[Part.Geometry] = []
+    for geoId in to_mirror:
+        geo = get_geometry(sketch, geoId)
+        newgeo: Optional[Part.Geometry] = None
+        if isinstance(geo, Part.LineSegment):
+            sp = geo.StartPoint
+            ep = geo.EndPoint
+            newgeo: Part.LineSegment = geo.clone()
+            newgeo.StartPoint = sp + 2.0 * (point_projector(sp) - sp)
+            newgeo.EndPoint = ep + 2.0 * (point_projector(ep) - ep)
+            results.is_start_end_inverted[geoId] = False
+        elif isinstance(geo, Part.Circle):
+            cp = geo.Center
+            newgeo: Part.Circle = geo.clone()
+            newgeo.Center = cp + 2.0 * (point_projector(cp) - cp)
+            results.is_start_end_inverted[geoId] = False
+        elif isinstance(geo, Part.ArcOfCircle):
+            sp = geo.StartPoint
+            ep = geo.EndPoint
+            cp = geo.Center
+
+            ssp = sp + 2.0 * (point_projector(sp) - sp)
+            sep = ep + 2.0 * (point_projector(ep) - ep)
+            scp = cp + 2.0 * (point_projector(cp) - cp)
+            theta1 = fmod(atan2(sep.y - scp.y, sep.x - scp.x), 2.0 * pi)
+            theta2 = fmod(atan2(ssp.y - scp.y, ssp.x - scp.x), 2.0 * pi)
+            if not is_line:
+                tmp = theta2
+                theta2 = theta1
+                theta1 = tmp
+            newgeo: Part.ArcOfCircle = geo.clone()
+            newgeo.Center = scp
+            # TODO: This is incorrect and the correct code (calling with third argument = True) is
+            #       unavailable in Python. Alternatively, duplicate the logic from GeomArcOfCircle::setRange.
+            #       However, everything seems to work just fine...
+            newgeo.setParameterRange(theta1, theta2)
+            results.is_start_end_inverted[geoId] = is_line
+        elif isinstance(geo, Part.Ellipse):
+            cp = geo.Center
+            majdir: FreeCAD.Vector = geo.XAxis
+            majord = geo.MajorRadius
+            minord = geo.MinorRadius
+            df = sqrt(majord ** 2 - minord ** 2)
+            f1 = cp + df * majdir
+            sf1 = f1 + 2.0 * (point_projector(f1) - f1)
+            scp = cp + 2.0 * (point_projector(cp) - cp)
+            newgeo: Part.Ellipse = geo.clone()
+            newgeo.XAxis = sf1 - scp
+            newgeo.Center = scp
+            results.is_start_end_inverted[geoId] = False
+            to_expose.add(geoId)
+        elif isinstance(geo, Part.ArcOfEllipse):
+            # FIXME: Missing important functions in Python API: getMajorAxisDir, getRange
+            raise UserReportError(
+                f"TODO: Python API is lacking for objects of type {geo}!"
+            )
+        elif isinstance(geo, Part.ArcOfHyperbola):
+            # FIXME: Missing important functions in Python API: getMajorAxisDir, getRange
+            raise UserReportError(
+                f"TODO: Python API is lacking for objects of type {geo}!"
+            )
+        elif isinstance(geo, Part.ArcOfParabola):
+            # FIXME: Missing important functions in Python API: getMajorAxisDir, getRange
+            raise UserReportError(
+                f"TODO: Python API is lacking for objects of type {geo}!"
+            )
+        elif isinstance(geo, Part.BSplineCurve):
+            newgeo: Part.BSplineCurve = geo.clone()
+            for idx, pole in zip(count(1), geo.getPoles()):
+                newgeo.setPole(idx, pole + 2 * (point_projector(pole) - pole))
+            results.is_start_end_inverted[geoId] = False
+            to_expose.add(geoId)
+        elif isinstance(geo, Part.Point):
+            cp = FreeCAD.Vector(geo.X, geo.Y, geo.Z)
+            newgeo = Part.Point(cp + 2.0 * (point_projector(cp) - cp))
+            results.is_start_end_inverted[geoId] = False
+        else:
+            raise InternalError(f"Unhandled type {type(geo)}")
+        new_geovals.append(newgeo)
+        results.geo_id_map[geoId] = cgeoid
+        cgeoid += 1
+
+    # Add all the new geometry to the sketch
+    for elem in new_geovals:
+        sketch.addGeometry(elem, False)
+    # Expose internal geometry of bsplines, ellipses etc
+    for e in to_expose:
+        sketch.exposeInternalGeometry(results.geo_id_map[e])
+    return results
+
+
+def fmt_constr_ref(constr_id: Union[str, int]):
+    """Helper to format constraint references for the expression engine."""
+    if isinstance(constr_id, int):
+        return f"Constraints[{constr_id}]"
+    elif isinstance(constr_id, str):
+        return f".Constraints.{constr_id}"
+
+
+def smart_symmetric(
+    sketch: "Sketcher.SketchSketchObject",
+    to_mirror: List[int],
+    mirror_geoid: int,
+    mirror_pointpos: PointPos,
+):
+    """Based on SketchObject::addSymmetric, but with extensions"""
+
+    # This indicates if we can safely copy horizontal/vertical and distancex/y constraints.
+    # This is only permissible when mirroring wrt a point or axis aligned.
+    # Technically it should be possible to convert h<->v and dx<->dy when mirroring wrt a 45 degree line, but that is
+    # way too much work for not enough usefulness.
+    hv_safe = False
+
+    geo_id_map: Dict[int, int] = {}
+    is_start_end_inverted: Dict[int, bool] = {}
+    if mirror_pointpos == PointPos.none:
+        # Mirroring around line
+        georef = get_geometry(sketch, mirror_geoid)
+        if not isinstance(georef, Part.LineSegment):
+            raise UserReportError(
+                f"Cannot mirror with respect to {georef} of type {type(georef)}. Try a line or point."
+            )
+        refstart: Base.Vector = georef.StartPoint
+        vectline: Base.Vector = georef.EndPoint - refstart
+        hv_safe = is_axis_aligned(vectline)
+        results = do_mirror(
+            sketch, lambda vec: perpendicular(vec, refstart, vectline), to_mirror, True
+        )
+        geo_id_map = results.geo_id_map
+        is_start_end_inverted = results.is_start_end_inverted
+    else:
+        # Mirroring around point
+        refpoint = get_point_vector(sketch, mirror_geoid, mirror_pointpos)
+        hv_safe = True
+        results = do_mirror(sketch, lambda _vec: refpoint, to_mirror, False)
+        geo_id_map = results.geo_id_map
+        is_start_end_inverted = results.is_start_end_inverted
+
+    def maybe_invert(geoid: int, posval: int) -> int:
+        """Helper to maybe invert pos values in constraints"""
+        if not is_start_end_inverted[geoid]:
+            return int(posval)
+        if posval == PointPos.start:
+            return int(PointPos.end)
+        elif posval == PointPos.end:
+            return int(PointPos.start)
+        elif posval == PointPos.none:
+            return int(PointPos.none)
+        raise InternalError(f"Unknown point position: {posval} for {geoid}")
+
+    constrvals = sketch.Constraints
+    constrid_ctr = len(constrvals)
+    constr_id_map: Dict[Union[str, int], int] = {}
+    mirror_set = set(to_mirror)
+
+    def add_constraint(
+        constraint: Sketcher.Constraint, constrid: int
+    ) -> Union[Tuple[int, int], Tuple[str, str]]:
+        """Helper to do bookkeeping while adding constraints"""
+        nonlocal constrid_ctr
+        # Make unique name.
+        # TODO: Numbers in case of multiple copies
+        old_name = None
+        if constraint.Name:
+            old_name = constraint.Name
+            constraint.Name = constraint.Name + "_mirror"
+        sketch.addConstraint(constraint)
+        constr_id_map[constrid] = constrid_ctr
+        if old_name:
+            constr_id_map[old_name] = constraint.Name
+        constrid_ctr += 1
+        if old_name:
+            return constraint.Name, old_name
+        else:
+            return constrid_ctr - 1, constrid
+
+    for orig_costrid, constr in zip(count(0), constrvals):
+        if constr.First in mirror_set:
+            # Save copies, as we will overwrite these, Constraints (unlike Part objects) have no Python exposed clone
+            # or copy methods.
+            c1 = constr.First
+            c2 = constr.Second
+            c3 = constr.Third
+            # If this constraint only the copied geometry, also copy the constraint
+            if c2 == GeoUndef:
+                # Extension to FreeCAD: Prefer equality constraints
+                if constr.Type in {"Distance", "Radius"}:
+                    add_constraint(
+                        Sketcher.Constraint("Equal", geo_id_map[c1], c1), orig_costrid
+                    )
+                # elif hv_safe and constr.Type in {'DistanceX', 'DistanceY'}:
+                #     do_add_constraint(Sketcher.Constraint('Equal', geo_id_map[c1], c1), orig_costrid)
+                # Extension to FreeCAD symmetry implementation: check if these are valid or not to copy (hv_safe)
+                elif hv_safe or constr.Type not in {
+                    "DistanceX",
+                    "DistanceY",
+                    "Horizontal",
+                    "Vertical",
+                }:
+                    constr.First = geo_id_map[c1]
+                    add_constraint(constr, orig_costrid)
+            # TODO: Maybe add special case for h distance/v distance of a single line segment or similar.
+            # elif c1 == c2 and constr.Third == GeoUndef and hv_safe and constr.Type in {'DistanceX', 'DistanceY'} \
+            #         and {constr.FirstPos, constr.SecondPos} == {PointPos.start, PointPos.end}:
+            #     do_add_constraint(Sketcher.Constraint('Equal', geo_id_map[c1], c1), orig_costrid)
+            elif c2 in mirror_set:
+                # Another geoid is involved, which is also being copied
+                if constr.Third == GeoUndef:
+                    if constr.Type in {
+                        "Coincident",
+                        "Perpendicular",
+                        "Parallel",
+                        "Tangent",
+                        "Distance",
+                        "Equal",
+                        "Radius",
+                        "Diameter",
+                        "Weight",
+                        "Angle",
+                        "PointOnObject",
+                    } or (hv_safe and constr.Type in {"DistanceX", "DistanceY"}):
+                        constr.First = geo_id_map[c1]
+                        constr.Second = geo_id_map[c2]
+                        constr.FirstPos = maybe_invert(c1, constr.FirstPos)
+                        constr.SecondPos = maybe_invert(c2, constr.SecondPos)
+                        # TODO: I'm not sure when this is needed, even without this things seems to work properly?
+                        # if constr.Type in {'Tangent', 'Perpendicular'}:
+                        #    raise InternalError("TODO: tangency stuff that is not accessible from Python...?")
+                        if constr.Type == "Angle" and mirror_pointpos == PointPos.none:
+                            # Value property is read-only. Construct new constraint from scratch
+                            cnew, cold = add_constraint(
+                                Sketcher.Constraint(
+                                    "Angle",
+                                    constr.First,
+                                    constr.FirstPos,
+                                    constr.Second,
+                                    constr.SecondPos,
+                                    -constr.Value,
+                                ),
+                                orig_costrid,
+                            )
+                        else:
+                            cnew, cold = add_constraint(constr, orig_costrid)
+                        # Extension: Refer to old constraints via expression engine.
+                        # This keeps the mirror intent.
+                        if constr.Type in {
+                            "Angle",
+                            "Diameter",
+                            "Radius",
+                            "DistanceX",
+                            "DistanceY",
+                        }:
+                            sketch.setExpression(
+                                fmt_constr_ref(cnew), fmt_constr_ref(cold)
+                            )
+                elif c3 in mirror_set:
+                    # Three geoids involved, all being copied!
+                    constr.First = geo_id_map[c1]
+                    constr.Second = geo_id_map[c2]
+                    constr.Third = geo_id_map[c3]
+                    constr.FirstPos = maybe_invert(c1, constr.FirstPos)
+                    constr.SecondPos = maybe_invert(c2, constr.SecondPos)
+                    constr.ThirdPos = maybe_invert(c3, constr.ThirdPos)
+                    add_constraint(constr, orig_costrid)
+
+    # Extension: Process expression engine and copy those
+    #  Basic idea:
+    #  * Record IDs and names of copied constraints above
+    #  * Process expression engine to see if any of them are relevant and should be copied
+    re_target = re.compile(
+        r"""Constraints\[(?P<num>[0-9]+)]|\.Constraints\.(?P<name>.*)"""
+    )
+    for target, expr in sketch.ExpressionEngine:
+        # Parse the target name:
+        m = re_target.match(target)
+        if not m:
+            raise InternalError(f"Unexpected format for expression engine target: {target}")
+        name = m.group("name")
+        num = m.group("num")
+        if num:
+            cid = int(num)
+        elif name:
+            cid = name
+        else:
+            raise InternalError(f"Unable to extract name/ID from expression engine for {target}")
+        # Check if it
+        if cid not in constr_id_map:
+            continue
+        # We could either copy the constraint, or refer to the original. Which
+        # one is best will vary on a case by case basis. I'm leaning towards
+        # referring to the original expression.
+        sketch.setExpression(fmt_constr_ref(constr_id_map[cid]), target)
+
+    FreeCAD.ActiveDocument.recompute()
+
+
+@contextlib.contextmanager
+def undoable(name: str):
+    """Decorator/context manager to make a function/block a FreeCAD transaction"""
+    try:
+        # Enable undo functionality
+        FreeCAD.setActiveTransaction(name)
+        yield
+        FreeCAD.closeActiveTransaction(False)
+    except BaseException as e:
+        FreeCAD.closeActiveTransaction(True)
+        raise
+
+
+@contextlib.contextmanager
+def error_handler():
+    """Decorator/context manager to report errors to user"""
+    try:
+        yield
+    except UserReportError as e:
+        QtWidgets.QMessageBox.critical(None, "Usage error in Smart Mirror", e.message)
+    except InternalError as e:
+        QtWidgets.QMessageBox.critical(
+            None,
+            "Internal Error in Smart Mirror",
+            f"Internal error. Check report view.\nMessage: {e.message}",
+        )
+        raise
+    except BaseException as e:
+        QtWidgets.QMessageBox.critical(
+            None,
+            "Unexpected exception in Smart Mirror",
+            f"Unexpected error! Check report view.\nError: {e}",
+        )
+        raise
+
+
+@error_handler()
+@undoable("Smart Mirror")
+def main():
+    """Code to deal with getting hold of the objects of interest from globals in FreeCAD"""
+    sel = Gui.Selection.getSelectionEx()
+    if not sel:
+        raise UserReportError("No objects selected.")
+    selection: Gui.SelectionObject = sel[0]
+    if selection.Object.TypeId != "Sketcher::SketchObject":
+        raise UserReportError("Selection does not appear to be in a sketch")
+    sketch = selection.Object  # type: Sketcher.SketchSketchObject
+
+    if len(selection.SubElementNames) < 2:
+        raise UserReportError("At least two sketch items must be selected")
+
+    # Use a set to deduplicate.
+    geoids: Set[int] = set()
+    for e in selection.SubElementNames[:-1]:
+        last_geoid = get_geo_id(sketch, e)
+        if last_geoid is not None:
+            geoids.add(last_geoid)
+
+    if not geoids:
+        raise UserReportError("No mirrorable elements selected.")
+
+    mirror_geoid, mirror_pointpos = get_mirror_ids(
+        sketch, selection.SubElementNames[-1]
+    )
+
+    smart_symmetric(sketch, sorted(geoids), mirror_geoid, mirror_pointpos)
+
+
+main()
