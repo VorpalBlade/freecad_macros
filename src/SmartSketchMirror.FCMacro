@@ -85,7 +85,7 @@ def get_geo_id(sketch: "Sketcher.SketchObject", object_name: str) -> Optional[in
         return -int(object_name[12:]) - 2
     elif object_name.startswith("Vertex"):
         return sketch.getGeoVertexIndex(int(object_name[6:]) - 1)[0]
-    elif object_name in ('H_Axis', 'V_Axis', 'RootPoint'):
+    elif object_name in ("H_Axis", "V_Axis", "RootPoint"):
         # Ignore certain well known names, we don't want to copy them anyway
         return None
     raise InternalError(f"Failed to get geo ID for {object_name}")
@@ -288,7 +288,9 @@ def fmt_constr_ref(constr_id: Union[str, int]):
         return f".Constraints.{constr_id}"
 
 
-def get_constr(sketch: "Sketcher.SketchSketchObject", ref: Union[str, int]) -> Sketcher.Constraint:
+def get_constr(
+    sketch: "Sketcher.SketchSketchObject", ref: Union[str, int]
+) -> Sketcher.Constraint:
     """Get hold of constraint, regardless of if it is named or not"""
     if isinstance(ref, int):
         return sketch.Constraints[ref]
@@ -476,7 +478,9 @@ def smart_symmetric(
         # Parse the target name:
         m = re_target.match(target)
         if not m:
-            raise InternalError(f"Unexpected format for expression engine target: {target}")
+            raise InternalError(
+                f"Unexpected format for expression engine target: {target}"
+            )
         name = m.group("name")
         num = m.group("num")
         if num:
@@ -484,7 +488,9 @@ def smart_symmetric(
         elif name:
             cid = name
         else:
-            raise InternalError(f"Unable to extract name/ID from expression engine for {target}")
+            raise InternalError(
+                f"Unable to extract name/ID from expression engine for {target}"
+            )
         # Check if it
         if cid not in constr_id_map:
             continue
