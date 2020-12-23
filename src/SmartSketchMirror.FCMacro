@@ -288,6 +288,17 @@ def fmt_constr_ref(constr_id: Union[str, int]):
         return f".Constraints.{constr_id}"
 
 
+def get_constr(sketch: "Sketcher.SketchSketchObject", ref: Union[str, int]) -> Sketcher.Constraint:
+    """Get hold of constraint, regardless of if it is named or not"""
+    if isinstance(ref, int):
+        return sketch.Constraints[ref]
+    elif isinstance(ref, str):
+        for c in sketch.Constraints:
+            if c.Name == ref:
+                return c
+    raise IndexError("Constraint not found")
+
+
 def smart_symmetric(
     sketch: "Sketcher.SketchSketchObject",
     to_mirror: List[int],
@@ -476,6 +487,10 @@ def smart_symmetric(
             raise InternalError(f"Unable to extract name/ID from expression engine for {target}")
         # Check if it
         if cid not in constr_id_map:
+            continue
+        # If the constraints are not of the same type, we need to ignore (happens if a length was
+        # converted to an equality for example).
+        if get_constr(sketch, cid).Type != get_constr(sketch, constr_id_map[cid]).Type:
             continue
         # We could either copy the constraint, or refer to the original. Which
         # one is best will vary on a case by case basis. I'm leaning towards
